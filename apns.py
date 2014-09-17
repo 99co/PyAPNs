@@ -139,7 +139,7 @@ class APNs(object):
         Returns an unsigned int from a packed big-endian (network) byte array
         """
         return unpack('>I', bytes)[0]
-    
+
     @staticmethod
     def unpacked_char_big_endian(bytes):
         """
@@ -251,7 +251,6 @@ class APNsConnection(object):
         return self._connection().read(n)
 
     def write(self, string):
-#         return self._connection().write(string)
         if self.enhanced: # nonblocking socket
             _, wlist, _ = select.select([], [self._connection()], [])
             if len(wlist) > 0:
@@ -342,12 +341,21 @@ class Frame(object):
     """A class representing an APNs message frame for multiple sending"""
     def __init__(self):
         self.frame_data = bytearray()
+        self.original_data = []
 
     def get_frame(self):
         return self.frame_data
 
     def add_item(self, token_hex, payload, identifier, expiry, priority):
         """Add a notification message to the frame"""
+        self.original_data.append({
+            'identifier': identifier,
+            'token_hex': token_hex,
+            'payload': payload,
+            'expiry': expiry,
+            'priority': priority
+        })
+
         item_len = 0
         self.frame_data.extend('\2' + APNs.packed_uint_big_endian(item_len))
 
@@ -462,6 +470,7 @@ class GatewayConnection(APNsConnection):
             self._is_resending = False
             self._last_resent_qty = 10
             self._response_listener = None
+            self._failed_ids = []
 
     def _get_notification(self, token_hex, payload):
         """
@@ -491,7 +500,7 @@ class GatewayConnection(APNsConnection):
          notification = pack(fmt, ENHANCED_NOTIFICATION_COMMAND, identifier, expiry,
                              TOKEN_LENGTH, token, len(payload), payload)
          return notification
-         
+
     def send_notification(self, token_hex, payload, identifier=0, expiry=0):
         """
         in enhanced mode, send_notification may return error response from APNs if any
@@ -506,7 +515,7 @@ class GatewayConnection(APNsConnection):
                     self.write(message)
                 except socket_error as e:
                     _logger.info("sending notification with id:" + str(identifier) + " to APNS failed: " + str(type(e)) + ": " + str(e))
-        
+
         else:
             self.write(self._get_notification(token_hex, payload))
 
@@ -523,22 +532,33 @@ class GatewayConnection(APNsConnection):
             elapsed += interval
 
     def send_notification_multiple(self, frame):
-        return self.write(frame.get_frame())
-    
+        if self.enhanced:
+            self._wait_resending(30)
+            with self._send_lock:
+                for data in frame.original_data:
+                    message = self._get_enhanced_notification(data['token_hex'], data['payload'], data['identifier'], data['expiry'])
+                    self._sent_notifications.append(dict({'id': data['identifier'], 'message': message}))
+                try:
+                    self.write(frame.get_frame())
+                except Exception as e:
+                    print e
+        else:
+            self.write(frame.get_frame())
+
     def register_response_listener(self, response_listener):
         self._response_listener = response_listener
-    
+
     def close_read_thread(self):
         self._close_read_thread = True
-    
+
     def _read_error_response(self):
         while not self._close_read_thread:
             time.sleep(0.1) #avoid crazy loop if something bad happened. e.g. using invalid certificate
             while not self.connection_alive:
                 time.sleep(0.1)
-            
+
             rlist, _, _ = select.select([self._connection()], [], [], 1)
-            
+
             if len(rlist) > 0: # there's error response from APNs
                 try:
                     buff = self.read(ERROR_RESPONSE_LENGTH)
@@ -562,13 +582,14 @@ class GatewayConnection(APNsConnection):
                         with self._send_lock:
                             self._reconnect()
                             self._resend_notifications_by_id(identifier)
-    
+
     def _resend_notifications_by_id(self, failed_identifier):
+        self._failed_ids.append(failed_identifier)
         fail_idx = Util.getListIndexFromID(self._sent_notifications, failed_identifier)
         #pop-out success notifications till failed one
         self._resend_notification_by_range(fail_idx+1, len(self._sent_notifications))
         return
-    
+
     def _resend_notification_by_range(self, start_idx, end_idx):
         self._sent_notifications = collections.deque(itertools.islice(self._sent_notifications, start_idx, end_idx))
         self._last_resent_qty = len(self._sent_notifications)
@@ -586,8 +607,9 @@ class GatewayConnection(APNsConnection):
 class Util(object):
     @classmethod
     def getListIndexFromID(this_class, the_list, identifier):
-        return next(index for (index, d) in enumerate(the_list) 
+        return next(index for (index, d) in enumerate(the_list)
                         if d['id'] == identifier)
+
     @classmethod
     def convert_error_response_to_dict(this_class, error_response_tuple):
         return {ER_STATUS: error_response_tuple[0], ER_IDENTIFER: error_response_tuple[1]}
